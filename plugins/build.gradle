@@ -1,0 +1,43 @@
+apply plugin: 'java'
+
+dependencies {
+    compile gradleApi()
+}
+
+apply plugin: 'maven'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+   compile 'log4j:log4j:1.2.17'
+   compile 'joda-time:joda-time:2.1'
+   compile 'com.google.guava:guava-jdk5:14.0.1'
+   compile 'org.jacoco:org.jacoco.core:0.6.2.201302030002'
+   compile 'org.jacoco:org.jacoco.agent:0.6.2.201302030002'
+
+   testCompile 'org.hamcrest:hamcrest-core:1.3'
+   testCompile 'org.hamcrest:hamcrest-library:1.3'
+   testCompile 'com.timgroup:stanislavski:0.7'
+   testCompile 'org.mockito:mockito-core:1.9.0'
+   testCompile('org.powermock:powermock-module-junit4:1.4.12') {
+      exclude group: 'junit'
+   }
+   testCompile('org.powermock:powermock-api-mockito:1.4.12') {
+      exclude group: 'org.mockito'
+   }
+}
+
+group = 'au.com.agiledigital'
+version = '1.0-SNAPSHOT'
+
+uploadArchives {
+    repositories {
+        mavenDeployer {
+            repository(url: uri('../repo'))
+        }
+    }
+}
+
+
