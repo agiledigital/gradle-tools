@@ -1,0 +1,34 @@
+apply plugin: 'java'
+apply plugin: 'groovy'
+apply plugin: 'eclipse'
+
+dependencies {
+    compile gradleApi()
+}
+
+apply plugin: 'maven'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+   compile 'log4j:log4j:1.2.17'
+   compile 'joda-time:joda-time:2.1'
+   compile 'com.google.guava:guava-jdk5:14.0.1'
+   compile 'org.jacoco:org.jacoco.core:0.6.2.201302030002'
+   compile 'org.jacoco:org.jacoco.agent:0.6.2.201302030002'
+
+}
+
+group = 'au.com.agiledigital'
+version = '0.1.0'
+name: 'jacoco-filter-plugin'
+
+uploadArchives {
+    repositories {
+        mavenDeployer {
+            repository(url: uri('../repo'))
+        }
+    }
+}
