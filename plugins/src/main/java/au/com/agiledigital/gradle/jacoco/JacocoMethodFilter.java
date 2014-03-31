@@ -8,14 +8,16 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Set;
 
 import org.jacoco.core.analysis.Analyzer;
 import org.jacoco.core.analysis.CoverageBuilder;
 import org.jacoco.core.analysis.IBundleCoverage;
 import org.jacoco.core.analysis.IClassCoverage;
 import org.jacoco.core.analysis.IPackageCoverage;
-import org.jacoco.core.data.ExecFileLoader;
 import org.jacoco.core.data.ExecutionData;
 import org.jacoco.core.data.ExecutionDataStore;
 import org.jacoco.core.data.ExecutionDataWriter;
@@ -29,39 +31,44 @@ import org.jacoco.core.runtime.SystemPropertiesRuntime;
 import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.Attribute;
 import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Label;
 
 /**
- * This class is responsible for opening an existing jacoco exec file and marking
- * the target methods as 100% covered. Its designed to remove the noise in
- * coverage created due to machine (eclipse) generated methods (toString, hashcode, etc).
- * These methods are assumed to be good and the risk of them being wrong is far smaller
- * than the impact of false negatives in coverage reports of jacoco.
+ * This class is responsible for opening an existing jacoco exec file and marking the target methods as 100% covered.
+ * Its designed to remove the noise in coverage created due to machine (eclipse) generated methods (toString, hashcode,
+ * etc). These methods are assumed to be good and the risk of them being wrong is far smaller than the impact of false
+ * negatives in coverage reports of jacoco.
  */
 public class JacocoMethodFilter {
 
-   private File execFileToRead;
+   private final ExecutionDataStore store;
 
-   private ExecFileLoader execInFileLoader;
+   private long startTimeMillis;
 
-   public JacocoMethodFilter(File execFileToRead) {
-      this.execFileToRead = execFileToRead;
+   private SessionInfo sessionInfo;
 
+   public JacocoMethodFilter() {
+      this.store = new ExecutionDataStore();
    }
 
-   private URLClassLoader getTargetClassLoader(final List<String> classDir) {
+   private URLClassLoader getTargetClassLoader(final Set<File> classDir,
+                                               final Set<File> classPath) {
       URL[] urls = null;
       try {
-         List<URL> urlLists = new ArrayList<URL>();
-         for (String s : classDir) {
-            urlLists.add(new File(s).toURI().toURL());
+         final List<URL> urlLists = new ArrayList<URL>();
+         for (final File s : classDir) {
+            urlLists.add(s.toURI().toURL());
          }
+
+         for (final File s : classPath) {
+            urlLists.add(s.toURI().toURL());
+         }
+
          urls = urlLists.toArray(new URL[urlLists.size()]);
       }
-      catch (MalformedURLException e) {
+      catch (final MalformedURLException e) {
       }
 
       return new URLClassLoader(urls);
@@ -74,300 +81,333 @@ public class JacocoMethodFilter {
     * @param execFileToRead
     * @param methodsToFilter
     */
-   public void filter(final List<String> methodsToFilter,
-                      final List<String> classDirs) throws IOException {
+   public void filter(final Collection<String> methodsToFilter,
+                      final Set<File> classDirs,
+                      final Set<File> classPaths) throws IOException {
 
-      this.loadExecutionData();
+      this.startTimeMillis = System.currentTimeMillis();
 
-      final ExecutionDataStore store = this.execInFileLoader.getExecutionDataStore();
+      final URLClassLoader urlClassLoader = this.getTargetClassLoader(classDirs, classPaths);
 
-      URLClassLoader urlClassLoader = this.getTargetClassLoader(classDirs);
+      for (final File classDir : classDirs) {
+         final IBundleCoverage bundleCoverage = this.analyzeStructure(classDir);
 
-      for (String classDir : classDirs) {
-         final IBundleCoverage bundleCoverage = analyzeStructure(new File(classDir));
-
-         for (IPackageCoverage packageCoverage : bundleCoverage.getPackages()) {
+         for (final IPackageCoverage packageCoverage : bundleCoverage.getPackages()) {
             for (final IClassCoverage classCoverage : packageCoverage.getClasses()) {
-               IRuntime runtime = new SystemPropertiesRuntime();
+
+               final IRuntime runtime = new SystemPropertiesRuntime();
 
                try {
-                  Class classToInstrument = urlClassLoader.loadClass(classCoverage.getName().replace("/", "."));
-                  String classAsPath = classCoverage.getName().replace('.', '/') + ".class";
-                  InputStream stream = classToInstrument.getClassLoader().getResourceAsStream(classAsPath);
+                  final Class<?> classToInstrument = urlClassLoader.loadClass(classCoverage.getName().replace("/", "."));
+                  final String classAsPath = classCoverage.getName().replace('.', '/') + ".class";
+                  final InputStream stream = classToInstrument.getClassLoader().getResourceAsStream(classAsPath);
 
-                  ClassReader reader = new ClassReader(stream);
-                  ClassWriter writer = new ClassWriter(reader, 0);
+                  final ClassReader reader = new ClassReader(stream);
+                  final ClassWriter writer = new ClassWriter(reader, 0);
 
-                  ClassInstrumenter instrumenter = new ClassInstrumenter(CRC64.checksum(reader.b), runtime, writer) {
+                  final LinkedList<Integer> setProbes = new LinkedList<Integer>();
+
+                  final ClassInstrumenter instrumenter = new ClassInstrumenter(CRC64.checksum(reader.b), runtime,
+                        writer) {
 
                      @Override
-                     public MethodProbesVisitor visitMethod(int access,
-                                                            String name,
-                                                            String desc,
-                                                            String signature,
-                                                            String[] exceptions) {
+                     public MethodProbesVisitor visitMethod(final int access,
+                                                            final String name,
+                                                            final String desc,
+                                                            final String signature,
+                                                            final String[] exceptions) {
                         MethodProbesVisitor visitor = super.visitMethod(access, name, desc, signature, exceptions);
-                        ExecutionData data = store.get(classCoverage.getId());
 
-                        if (methodsToFilter.contains(name) && data != null) {
-                           
-                           visitor = new MethodFilteringEmmitingMethodProbesVisitor(data, visitor);
+                        if (methodsToFilter.contains(name)) {
+
+                           final MethodFilteringEmmitingMethodProbesVisitor filteringVisitor = new MethodFilteringEmmitingMethodProbesVisitor(
+                                 setProbes, visitor);
+                           visitor = filteringVisitor;
                         }
 
                         return visitor;
                      }
                   };
 
-                  ClassVisitor visitor = new ClassProbesAdapter(instrumenter);
+                  final ClassProbesAdapter visitor = new ClassProbesAdapter(instrumenter);
                   reader.accept(visitor, ClassReader.EXPAND_FRAMES);
+                  final int numberOfProbes = visitor.nextId();
+
+                  final ExecutionData executionData = this.store.get(classCoverage.getId(),
+                                                                     classCoverage.getName(),
+                                                                     numberOfProbes);
+                  for (final Integer integer : setProbes) {
+                     executionData.getProbes()[integer] = true;
+                  }
+
                }
-               catch (ClassNotFoundException e) {
+               catch (final ClassNotFoundException e) {
                   // Somethings we cant find. Ignore it
                }
             }
          }
       }
       urlClassLoader.close();
+
+      this.sessionInfo = new SessionInfo("method-filter", this.startTimeMillis, System.currentTimeMillis());
    }
 
-   private void loadExecutionData() throws IOException {
-      this.execInFileLoader = new ExecFileLoader();
-      this.execInFileLoader.load(this.execFileToRead);
-   }
-
-   private IBundleCoverage analyzeStructure(File classesDirectory) throws IOException {
+   private IBundleCoverage analyzeStructure(final File classesDirectory) throws IOException {
       final CoverageBuilder coverageBuilder = new CoverageBuilder();
-      ExecutionDataStore executionData = new ExecutionDataStore();
+      final ExecutionDataStore executionData = new ExecutionDataStore();
       final Analyzer analyzer = new Analyzer(executionData, coverageBuilder);
       analyzer.analyzeAll(classesDirectory);
 
       return coverageBuilder.getBundle(classesDirectory.getName());
    }
 
-   public void save(File execOut) throws IOException {
-      ExecutionDataWriter writer = new ExecutionDataWriter(new FileOutputStream(execOut));
+   public void save(final File execOut) throws IOException {
+      final ExecutionDataWriter writer = new ExecutionDataWriter(new FileOutputStream(execOut));
 
-      for (SessionInfo info : this.execInFileLoader.getSessionInfoStore().getInfos()) {
-         writer.visitSessionInfo(info);
-      }
+      writer.visitSessionInfo(this.sessionInfo);
 
-      for (ExecutionData data : this.execInFileLoader.getExecutionDataStore().getContents()) {
+      for (final ExecutionData data : this.store.getContents()) {
          writer.visitClassExecution(data);
       }
    }
 
    public class MethodFilteringEmmitingMethodProbesVisitor extends MethodProbesVisitor {
-      private MethodProbesVisitor delegate;
 
-      private List<Integer> probeIds;
+      private final MethodProbesVisitor delegate;
 
-      private ExecutionData data;
+      private final List<Integer> probesToSet;
 
-      public void visitProbe(int probeId) {
-         delegate.visitProbe(probeId);
-         this.probeIds.add(probeId);
-      }
-
-      public void visitJumpInsnWithProbe(int opcode,
-                                         Label label,
-                                         int probeId) {
-         delegate.visitJumpInsnWithProbe(opcode, label, probeId);
-         this.probeIds.add(probeId);
-      }
-
-      public int hashCode() {
-         return delegate.hashCode();
-      }
-
-      public void visitInsnWithProbe(int opcode,
-                                     int probeId) {
-         delegate.visitInsnWithProbe(opcode, probeId);
-         this.probeIds.add(probeId);
-      }
-
-      public void visitTableSwitchInsnWithProbes(int min,
-                                                 int max,
-                                                 Label dflt,
-                                                 Label[] labels) {
-         delegate.visitTableSwitchInsnWithProbes(min, max, dflt, labels);
-      }
-
-      public boolean equals(Object obj) {
-         return delegate.equals(obj);
-      }
-
-      public void visitLookupSwitchInsnWithProbes(Label dflt,
-                                                  int[] keys,
-                                                  Label[] labels) {
-         delegate.visitLookupSwitchInsnWithProbes(dflt, keys, labels);
-      }
-
-      public AnnotationVisitor visitAnnotationDefault() {
-         return delegate.visitAnnotationDefault();
-      }
-
-      public AnnotationVisitor visitAnnotation(String desc,
-                                               boolean visible) {
-         return delegate.visitAnnotation(desc, visible);
-      }
-
-      public AnnotationVisitor visitParameterAnnotation(int parameter,
-                                                        String desc,
-                                                        boolean visible) {
-         return delegate.visitParameterAnnotation(parameter, desc, visible);
-      }
-
-      public void visitAttribute(Attribute attr) {
-         delegate.visitAttribute(attr);
-      }
-
-      public void visitCode() {
-         delegate.visitCode();
-      }
-
-      public void visitFrame(int type,
-                             int nLocal,
-                             Object[] local,
-                             int nStack,
-                             Object[] stack) {
-         delegate.visitFrame(type, nLocal, local, nStack, stack);
-      }
-
-      public String toString() {
-         return delegate.toString();
-      }
-
-      public void visitInsn(int opcode) {
-         delegate.visitInsn(opcode);
-      }
-
-      public void visitIntInsn(int opcode,
-                               int operand) {
-         delegate.visitIntInsn(opcode, operand);
-      }
-
-      public void visitVarInsn(int opcode,
-                               int var) {
-         delegate.visitVarInsn(opcode, var);
-      }
-
-      public void visitTypeInsn(int opcode,
-                                String type) {
-         delegate.visitTypeInsn(opcode, type);
-      }
-
-      public void visitFieldInsn(int opcode,
-                                 String owner,
-                                 String name,
-                                 String desc) {
-         delegate.visitFieldInsn(opcode, owner, name, desc);
-      }
-
-      public void visitMethodInsn(int opcode,
-                                  String owner,
-                                  String name,
-                                  String desc) {
-         delegate.visitMethodInsn(opcode, owner, name, desc);
-      }
-
-      public void visitInvokeDynamicInsn(String name,
-                                         String desc,
-                                         Handle bsm,
-                                         Object... bsmArgs) {
-         delegate.visitInvokeDynamicInsn(name, desc, bsm, bsmArgs);
-      }
-
-      public void visitJumpInsn(int opcode,
-                                Label label) {
-         delegate.visitJumpInsn(opcode, label);
-      }
-
-      public void visitLabel(Label label) {
-         delegate.visitLabel(label);
-      }
-
-      public void visitLdcInsn(Object cst) {
-         delegate.visitLdcInsn(cst);
-      }
-
-      public void visitIincInsn(int var,
-                                int increment) {
-         delegate.visitIincInsn(var, increment);
-      }
-
-      public void visitTableSwitchInsn(int min,
-                                       int max,
-                                       Label dflt,
-                                       Label... labels) {
-         delegate.visitTableSwitchInsn(min, max, dflt, labels);
-      }
-
-      public void visitLookupSwitchInsn(Label dflt,
-                                        int[] keys,
-                                        Label[] labels) {
-         delegate.visitLookupSwitchInsn(dflt, keys, labels);
-      }
-
-      public void visitMultiANewArrayInsn(String desc,
-                                          int dims) {
-         delegate.visitMultiANewArrayInsn(desc, dims);
-      }
-
-      public void visitTryCatchBlock(Label start,
-                                     Label end,
-                                     Label handler,
-                                     String type) {
-         delegate.visitTryCatchBlock(start, end, handler, type);
-      }
-
-      public void visitLocalVariable(String name,
-                                     String desc,
-                                     String signature,
-                                     Label start,
-                                     Label end,
-                                     int index) {
-         delegate.visitLocalVariable(name, desc, signature, start, end, index);
-      }
-
-      public void visitLineNumber(int line,
-                                  Label start) {
-         delegate.visitLineNumber(line, start);
-      }
-
-      public void visitMaxs(int maxStack,
-                            int maxLocals) {
-         delegate.visitMaxs(maxStack, maxLocals);
-      }
-
-      public void visitEnd() {
-         delegate.visitEnd();
-
-         if (data != null) {
-            for (int i : this.probeIds) {
-               data.getProbes()[i] = true;
-            }
-         }
-      }
-
-      public MethodFilteringEmmitingMethodProbesVisitor(ExecutionData data,
-                                                        MethodProbesVisitor delegate) {
+      public MethodFilteringEmmitingMethodProbesVisitor(final List<Integer> probesToSet,
+                                                        final MethodProbesVisitor delegate) {
+         this.probesToSet = probesToSet;
          this.delegate = delegate;
-         this.probeIds = new ArrayList<Integer>();
-         this.data = data;
       }
+
+      @Override
+      public void visitProbe(final int probeId) {
+         this.delegate.visitProbe(probeId);
+         this.probesToSet.add(probeId);
+      }
+
+      @Override
+      public void visitJumpInsnWithProbe(final int opcode,
+                                         final Label label,
+                                         final int probeId) {
+         this.delegate.visitJumpInsnWithProbe(opcode, label, probeId);
+         this.probesToSet.add(probeId);
+      }
+
+      @Override
+      public int hashCode() {
+         return this.delegate.hashCode();
+      }
+
+      @Override
+      public void visitInsnWithProbe(final int opcode,
+                                     final int probeId) {
+         this.delegate.visitInsnWithProbe(opcode, probeId);
+         this.probesToSet.add(probeId);
+      }
+
+      @Override
+      public void visitTableSwitchInsnWithProbes(final int min,
+                                                 final int max,
+                                                 final Label dflt,
+                                                 final Label[] labels) {
+         this.delegate.visitTableSwitchInsnWithProbes(min, max, dflt, labels);
+      }
+
+      @Override
+      public boolean equals(final Object obj) {
+         return this.delegate.equals(obj);
+      }
+
+      @Override
+      public void visitLookupSwitchInsnWithProbes(final Label dflt,
+                                                  final int[] keys,
+                                                  final Label[] labels) {
+         this.delegate.visitLookupSwitchInsnWithProbes(dflt, keys, labels);
+      }
+
+      @Override
+      public AnnotationVisitor visitAnnotationDefault() {
+         return this.delegate.visitAnnotationDefault();
+      }
+
+      @Override
+      public AnnotationVisitor visitAnnotation(final String desc,
+                                               final boolean visible) {
+         return this.delegate.visitAnnotation(desc, visible);
+      }
+
+      @Override
+      public AnnotationVisitor visitParameterAnnotation(final int parameter,
+                                                        final String desc,
+                                                        final boolean visible) {
+         return this.delegate.visitParameterAnnotation(parameter, desc, visible);
+      }
+
+      @Override
+      public void visitAttribute(final Attribute attr) {
+         this.delegate.visitAttribute(attr);
+      }
+
+      @Override
+      public void visitCode() {
+         this.delegate.visitCode();
+      }
+
+      @Override
+      public void visitFrame(final int type,
+                             final int nLocal,
+                             final Object[] local,
+                             final int nStack,
+                             final Object[] stack) {
+         this.delegate.visitFrame(type, nLocal, local, nStack, stack);
+      }
+
+      @Override
+      public String toString() {
+         return this.delegate.toString();
+      }
+
+      @Override
+      public void visitInsn(final int opcode) {
+         this.delegate.visitInsn(opcode);
+      }
+
+      @Override
+      public void visitIntInsn(final int opcode,
+                               final int operand) {
+         this.delegate.visitIntInsn(opcode, operand);
+      }
+
+      @Override
+      public void visitVarInsn(final int opcode,
+                               final int var) {
+         this.delegate.visitVarInsn(opcode, var);
+      }
+
+      @Override
+      public void visitTypeInsn(final int opcode,
+                                final String type) {
+         this.delegate.visitTypeInsn(opcode, type);
+      }
+
+      @Override
+      public void visitFieldInsn(final int opcode,
+                                 final String owner,
+                                 final String name,
+                                 final String desc) {
+         this.delegate.visitFieldInsn(opcode, owner, name, desc);
+      }
+
+      @Override
+      public void visitMethodInsn(final int opcode,
+                                  final String owner,
+                                  final String name,
+                                  final String desc) {
+         this.delegate.visitMethodInsn(opcode, owner, name, desc);
+      }
+
+      @Override
+      public void visitInvokeDynamicInsn(final String name,
+                                         final String desc,
+                                         final Handle bsm,
+                                         final Object... bsmArgs) {
+         this.delegate.visitInvokeDynamicInsn(name, desc, bsm, bsmArgs);
+      }
+
+      @Override
+      public void visitJumpInsn(final int opcode,
+                                final Label label) {
+         this.delegate.visitJumpInsn(opcode, label);
+      }
+
+      @Override
+      public void visitLabel(final Label label) {
+         this.delegate.visitLabel(label);
+      }
+
+      @Override
+      public void visitLdcInsn(final Object cst) {
+         this.delegate.visitLdcInsn(cst);
+      }
+
+      @Override
+      public void visitIincInsn(final int var,
+                                final int increment) {
+         this.delegate.visitIincInsn(var, increment);
+      }
+
+      @Override
+      public void visitTableSwitchInsn(final int min,
+                                       final int max,
+                                       final Label dflt,
+                                       final Label... labels) {
+         this.delegate.visitTableSwitchInsn(min, max, dflt, labels);
+      }
+
+      @Override
+      public void visitLookupSwitchInsn(final Label dflt,
+                                        final int[] keys,
+                                        final Label[] labels) {
+         this.delegate.visitLookupSwitchInsn(dflt, keys, labels);
+      }
+
+      @Override
+      public void visitMultiANewArrayInsn(final String desc,
+                                          final int dims) {
+         this.delegate.visitMultiANewArrayInsn(desc, dims);
+      }
+
+      @Override
+      public void visitTryCatchBlock(final Label start,
+                                     final Label end,
+                                     final Label handler,
+                                     final String type) {
+         this.delegate.visitTryCatchBlock(start, end, handler, type);
+      }
+
+      @Override
+      public void visitLocalVariable(final String name,
+                                     final String desc,
+                                     final String signature,
+                                     final Label start,
+                                     final Label end,
+                                     final int index) {
+         this.delegate.visitLocalVariable(name, desc, signature, start, end, index);
+      }
+
+      @Override
+      public void visitLineNumber(final int line,
+                                  final Label start) {
+         this.delegate.visitLineNumber(line, start);
+      }
+
+      @Override
+      public void visitMaxs(final int maxStack,
+                            final int maxLocals) {
+         this.delegate.visitMaxs(maxStack, maxLocals);
+      }
+
+      @Override
+      public void visitEnd() {
+         this.delegate.visitEnd();
+      }
+
    }
 
-   public static void main(String[] args) {
-      if (args.length < 4) {
-         System.out.println("Usage: filter <in exec file> <out exec file> <classdirs> <method list comma seperated>");
+   public static void main(final String[] args) {
+      if (args.length < 3) {
+         System.out.println("Usage: filter <out exec file> <classdirs comma seperated> <method list comma seperated>");
          System.exit(1);
       }
 
-      File jacocoInExec = new File(args[0]);
-      File jacocoOutExec = new File(args[1]);
-      List<String> classDirs = new ArrayList<String>();
+      final File jacocoOutExec = new File(args[0]);
+      final List<String> classDirs = new ArrayList<String>();
 
-      for (String method : args[2].split(",")) {
+      for (String method : args[1].split(",")) {
          method = method.trim();
 
          if (!method.isEmpty()) {
@@ -375,9 +415,9 @@ public class JacocoMethodFilter {
          }
       }
 
-      List<String> filterMethods = new ArrayList<String>();
+      final List<String> filterMethods = new ArrayList<String>();
 
-      for (String method : args[3].split(",")) {
+      for (String method : args[2].split(",")) {
          method = method.trim();
 
          if (!method.isEmpty()) {
@@ -385,23 +425,18 @@ public class JacocoMethodFilter {
          }
       }
 
-      if (!jacocoInExec.canRead()) {
-         System.out.println("Unable to read jacoco exec file [" + jacocoInExec + "]");
-         System.exit(1);
-      }
-
       if (!jacocoOutExec.getParentFile().canWrite()) {
          System.out.println("Unable to write to jacoco exec file [" + jacocoOutExec + "]");
          System.exit(1);
       }
 
-      JacocoMethodFilter filter = new JacocoMethodFilter(jacocoInExec);
+      final JacocoMethodFilter filter = new JacocoMethodFilter();
 
       try {
-         filter.filter(filterMethods, classDirs);
+         // filter.filter(filterMethods, classDirs);
          filter.save(jacocoOutExec);
       }
-      catch (IOException e) {
+      catch (final IOException e) {
          System.out.println("Unable to process exec file [" + e.getMessage() + "]");
          throw new RuntimeException(e);
       }
